@@ -1,0 +1,47 @@
+# ── Secrets & env ──────────────────────────────────────────────────────────
+.env
+
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+
+# ── Virtual environments ──────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Models & large binaries ───────────────────────────────────────────────
+models/
+livekit-server.exe
+*.zip
+*.tar.gz
+*.bin
+*.onnx
+*.pt
+*.pth
+
+# ── IDE & editor ──────────────────────────────────────────────────────────
+.claude/
+*.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS files ──────────────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── Testing & coverage ───────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
