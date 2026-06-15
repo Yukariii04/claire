@@ -1,34 +1,44 @@
 """
-claire Voice Agent — Main Agent
-Pipeline: Vosk STT → Groq LLM (OpenAI-compatible) → Kokoro TTS + Silero VAD
+Claire Voice Agent — Main Entry Point  (no LiveKit)
+Pipeline: sounddevice mic → Vosk STT → Groq LLM → Kokoro TTS → speaker
+UI: Dynamic Island overlay (customtkinter, always-on-top)
 
 Run via:  uv run claire_voice
-Startup order:
-  1. livekit-server --dev      (terminal 1)
-  2. uv run claire             (terminal 2 — MCP server)
-  3. uv run claire_voice       (terminal 3 — this file)
+That's it — one command, no other terminals needed (MCP server optional).
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import queue
 import sys
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentSession, cli, mcp
-from livekit.plugins import openai as lk_openai
-from livekit.plugins import silero
 
-from voice_agent.vosk_stt import VoskSTT
-from voice_agent.kokoro_tts import KokoroTTS
+from voice_agent.overlay import ClaireOverlay, OverlayEvent
+from voice_agent.pipeline import DirectPipeline
 
 load_dotenv()
 
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.WARNING,      # suppress verbose INFO from httpx, phonemizer, etc.
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Only show our own logger at INFO level
+logging.getLogger("claire").setLevel(logging.INFO)
+logging.getLogger("claire.pipeline").setLevel(logging.INFO)
+logger = logging.getLogger("claire")
+
 # ── Config ─────────────────────────────────────────────────────────────────
-VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH", "models/vosk-model-en-us-0.22")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
-MCP_SERVER_URL  = "http://127.0.0.1:8000/sse"
+
+if not GROQ_API_KEY:
+    logger.error("GROQ_API_KEY not set in .env — Claire can't think without it!")
+    sys.exit(1)
 
 
 # ── System Prompt ──────────────────────────────────────────────────────────
@@ -86,44 +96,97 @@ def _greeting() -> str:
         return "Good evening, boss. What are you up to tonight?"
 
 
-# ── Claire Agent ───────────────────────────────────────────────────────────
+# ── Overlay ↔ Pipeline bridge ──────────────────────────────────────────────
 
-class ClaireAgent(Agent):
-    def __init__(self):
-        super().__init__(instructions=SYSTEM_PROMPT)
+_overlay_queue: queue.Queue[OverlayEvent] = queue.Queue()
+_pipeline: DirectPipeline | None = None
 
-    async def on_enter(self):
-        await self.session.say(_greeting(), allow_interruptions=True)
+
+def _push(kind: str, value: str | None = None):
+    """Send an event to the overlay (thread-safe)."""
+    _overlay_queue.put(OverlayEvent(kind=kind, value=value))
+
+
+def _handle_mute_toggle():
+    """Called from overlay's mute button."""
+    if _pipeline:
+        _pipeline.set_muted(not _pipeline._muted)
+
+
+def _handle_end_session():
+    """Called from overlay's End button."""
+    if _pipeline:
+        _pipeline.stop()
+    os._exit(0)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
-async def entrypoint(ctx: cli.JobContext):
-    await ctx.connect()
+def main():
+    """
+    Start Claire:
+      1. Create the DirectPipeline (loads Kokoro TTS model)
+      2. Launch the pipeline in a background thread
+      3. Play the greeting via TTS
+      4. Run the Dynamic Island overlay on the main thread (blocks)
+    """
+    global _pipeline
 
-    session = AgentSession(
-        stt=VoskSTT(model_path=VOSK_MODEL_PATH),
-        llm=lk_openai.LLM(
-            model="llama-3.1-8b-instant",
-            api_key=GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
-        ),
-        tts=KokoroTTS(voice="af_heart", speed=1.15),
-        vad=silero.VAD.load(),
-        turn_detection="vad",
-        min_endpointing_delay=0.3,
-        mcp_servers=[mcp.MCPServerHTTP(url=MCP_SERVER_URL)],
+    # ── Startup banner ────────────────────────────────────────────────────
+    print()
+    print("\033[95m\033[1m"  # magenta bold
+          "  ██████ █     ████ █ █████ █████\n"
+          "  █      █     █  █ █ █  █  █    \n"
+          "  █      █     ████ █ ███   ███  \n"
+          "  █      █     █  █ █ █  █  █    \n"
+          "  ██████ █████ █  █ █ █   █ █████"
+          "\033[0m")
+    print("\033[2m" + "─" * 42 + "\033[0m")
+    print("  \033[96mVoice Agent\033[0m  │  \033[93mWhisper STT\033[0m  │  \033[92mKokoro TTS\033[0m")
+    print("\033[2m" + "─" * 42 + "\033[0m")
+    print()
+
+    logger.info("Initializing pipeline…")
+
+    _pipeline = DirectPipeline(
+        groq_api_key=GROQ_API_KEY,
+        system_prompt=SYSTEM_PROMPT,
+        emit=_push,
     )
 
-    await session.start(agent=ClaireAgent(), room=ctx.room)
+    # Start the audio pipeline (background thread)
+    _pipeline.start()
+
+    # Greet the user (TTS plays in the pipeline thread)
+    import threading
+    def _greet():
+        import time
+        from voice_agent.pipeline import _print_terminal
+        time.sleep(1.0)         # let the overlay appear first
+        greeting = _greeting()
+        _push("state", "speaking")
+        _push("agent_transcript", greeting)
+        _print_terminal("claire", greeting)
+        _pipeline._speak(greeting)
+        _push("state", "idle")
+        _print_terminal("state", "Standing by…")
+
+    threading.Thread(target=_greet, daemon=True).start()
+
+    # Run the overlay on the main thread (blocks forever)
+    logger.info("Launching Dynamic Island overlay…")
+    overlay = ClaireOverlay(
+        event_queue=_overlay_queue,
+        on_mute_toggle=_handle_mute_toggle,
+        on_end_session=_handle_end_session,
+    )
+    overlay.run()
 
 
+# Allow `uv run claire_voice` to work via the old entry point name
 def dev():
-    """CLI wrapper — auto-injects 'dev' arg so users don't need to type it manually."""
-    if len(sys.argv) == 1:
-        sys.argv.append("dev")
-    cli.run_app(cli.WorkerOptions(entrypoint_fnc=entrypoint))
+    main()
 
 
 if __name__ == "__main__":
-    dev()
+    main()

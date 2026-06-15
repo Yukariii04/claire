@@ -19,7 +19,6 @@ env/
 
 # ── Models & large binaries ───────────────────────────────────────────────
 models/
-livekit-server.exe
 *.zip
 *.tar.gz
 *.bin

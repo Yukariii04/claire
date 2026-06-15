@@ -1,18 +1,20 @@
 # claire 🤖
 
-A **real-time AI voice assistant** that runs 100% locally on Windows.  
-Listens → thinks → speaks. Launches apps, plays Spotify, opens YouTube, shows code in a terminal.
+A **real-time AI voice assistant** that runs locally on Windows.  
+Listens → thinks → speaks. Launches apps, plays Spotify, opens YouTube, fetches news, shows code in a terminal.
+
+Now with a **Dynamic Island** floating overlay — no browser needed.
 
 **Stack** — all free, no paid APIs (except a free Groq key):
 
 | Component | Technology |
 |-----------|-----------|
-| STT | Vosk (offline) |
+| STT | Groq Whisper (`whisper-large-v3`) |
 | LLM | Groq Cloud — `llama-3.1-8b-instant` (free tier) |
-| TTS | Kokoro-82M (offline) |
-| VAD | Silero |
-| WebRTC | Local LiveKit Server |
-| MCP | FastMCP (SSE) |
+| TTS | Kokoro-82M (offline, local) |
+| VAD | Energy-based (built-in) |
+| Audio | sounddevice (direct mic/speaker) |
+| UI | Dynamic Island overlay (customtkinter) |
 
 ---
 
@@ -22,11 +24,9 @@ Listens → thinks → speaks. Launches apps, plays Spotify, opens YouTube, show
 
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv) — `pip install uv`
-- [livekit-server binary](https://github.com/livekit/livekit/releases) — download and add to PATH
-- Vosk model — download `vosk-model-en-us-0.22` from https://alphacephei.com/vosk/models  
-  and unzip into `models/vosk-model-en-us-0.22/`
 - Free Groq API key — https://console.groq.com
-- YouTube app installed from the Microsoft Store (for `play_youtube` tool)
+- Kokoro TTS models — `kokoro-v1_0.onnx` and `voices-v1_0.bin` in the project root
+- YouTube app from the Microsoft Store (for `play_youtube` tool)
 
 ### 2. Install
 
@@ -42,38 +42,17 @@ copy .env.example .env
 # Edit .env and add your GROQ_API_KEY
 ```
 
-### 4. Download Kokoro model files
+### 4. Run  ← Just ONE command!
 
-On first run, `kokoro-onnx` will automatically download the model (~330 MB).  
-Or download manually:
-```powershell
-uv run python -c "from kokoro_onnx import Kokoro; Kokoro('kokoro-v1_0.onnx', 'voices-v1_0.bin')"
-```
-
-### 5. Run (3 terminals)
-
-**Terminal 1 — LiveKit server:**
-```powershell
-livekit-server --dev
-```
-
-**Terminal 2 — MCP server:**
-```powershell
-uv run claire
-```
-
-**Terminal 3 — Voice agent:**
 ```powershell
 uv run claire_voice
 ```
 
-### 6. Connect
-
-Open https://agents-playground.livekit.io and connect to `ws://localhost:7880` with API key `devkey` and secret `secret`.
+That's it. The Dynamic Island overlay pops up, Claire greets you, and starts listening.
 
 ---
 
-## Tools
+## Tools (12 total — all called automatically by the LLM)
 
 | Tool | What it does |
 |------|-------------|
@@ -89,13 +68,40 @@ Open https://agents-playground.livekit.io and connect to `ws://localhost:7880` w
 | `play_spotify` | Plays music/artist/playlist in Spotify app |
 | `play_youtube` | Searches/plays in YouTube Windows app |
 | `show_code_in_terminal` | Displays code in a new PowerShell window |
-| `format_json` | Pretty-prints JSON |
-| `word_count` | Counts chars/words/lines |
 
 ---
 
+## Architecture
+
+```
+Microphone → sounddevice → Energy VAD → Groq Whisper STT → Groq LLM → Kokoro TTS → Speaker
+                                                              ↕
+                                                         Tool Calls
+                                                        (12 built-in)
+```
+
+No LiveKit. No WebRTC. No browser. No MCP server. Just your mic and speaker.
+
+---
+
+## Project Structure
+
+```
+claire/
+├── voice_agent/
+│   ├── __init__.py          # Package marker
+│   ├── agent_claire.py      # Entry point — wires pipeline + overlay
+│   ├── pipeline.py          # Audio pipeline (VAD → STT → LLM → TTS)
+│   └── overlay.py           # Dynamic Island UI (customtkinter)
+├── kokoro-v1_0.onnx         # Kokoro TTS model (gitignored)
+├── voices-v1_0.bin          # Kokoro voice data (gitignored)
+├── pyproject.toml           # Dependencies & entry point
+├── .env.example             # Template for secrets
+└── README.md
+```
+
 ## Adding Tools
 
-1. Create `mcp_server/tools/my_tool.py`
-2. Define `def register(mcp):` and use `@mcp.tool()` decorators
-3. Import and call `register(mcp)` in `mcp_server/tools/__init__.py`
+Tools are defined inline in `voice_agent/pipeline.py`:
+1. Add the tool schema to `TOOL_SCHEMAS`
+2. Add the implementation to `_execute_tool()`
