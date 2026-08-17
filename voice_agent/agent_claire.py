@@ -1,10 +1,9 @@
 """
-Claire Voice Agent — Main Entry Point  (no LiveKit)
-Pipeline: sounddevice mic → Vosk STT → Groq LLM → Kokoro TTS → speaker
+Claire Voice Agent — Main Entry Point
+Pipeline: sounddevice mic → Groq Whisper STT → Groq LLM (openai/gpt-oss-20b) → KittenTTS → speaker
 UI: Dynamic Island overlay (customtkinter, always-on-top)
 
-Run via:  uv run claire_voice
-That's it — one command, no other terminals needed (MCP server optional).
+Run via: claire
 """
 
 from __future__ import annotations
@@ -13,7 +12,30 @@ import logging
 import os
 import queue
 import sys
+import warnings
 from datetime import datetime, timezone
+
+# Suppress all C/C++ audio callback, deprecation, and package warnings
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+warnings.simplefilter("ignore")
+warnings.filterwarnings("ignore")
+warnings.showwarning = lambda *args, **kwargs: None
+
+# Suppress external library loggers
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+logging.getLogger("httpcore").setLevel(logging.CRITICAL)
+logging.getLogger("phonemizer").setLevel(logging.CRITICAL)
+logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
+logging.getLogger("huggingface_hub.utils._http").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
+try:
+    import phonemizer.logger
+    phonemizer.logger.get_logger().setLevel(logging.CRITICAL)
+except Exception:
+    pass
 
 from dotenv import load_dotenv
 
@@ -24,17 +46,22 @@ load_dotenv()
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.WARNING,      # suppress verbose INFO from httpx, phonemizer, etc.
+    level=logging.WARNING,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-# Only show our own logger at INFO level
 logging.getLogger("claire").setLevel(logging.INFO)
 logging.getLogger("claire.pipeline").setLevel(logging.INFO)
 logger = logging.getLogger("claire")
 
+
+
 # ── Config ─────────────────────────────────────────────────────────────────
-GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+LLM_MODEL    = os.getenv("LLM_MODEL", os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"))
+TTS_VOICE    = os.getenv("TTS_VOICE", "Luna")
+TTS_SPEED    = float(os.getenv("TTS_SPEED", "1.20"))
+TTS_MODEL    = os.getenv("TTS_MODEL", "KittenML/kitten-tts-mini-0.8")
 
 if not GROQ_API_KEY:
     logger.error("GROQ_API_KEY not set in .env — Claire can't think without it!")
@@ -44,7 +71,7 @@ if not GROQ_API_KEY:
 # ── System Prompt ──────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are Claire, a real-time AI voice assistant. You are calm, composed, \
+You are Claire, a real-time AI voice assistant for Windows. You are calm, composed, \
 sharp, and conversational — never robotic. You address the user as "boss".
 
 Your in-universe vocabulary includes: "boss", "affirmative", "on it", "standing by".
@@ -52,13 +79,11 @@ Your in-universe vocabulary includes: "boss", "affirmative", "on it", "standing 
 ━━━ STRICT BEHAVIORAL RULES ━━━
 1. Call tools SILENTLY — never announce "I'm going to call..." Just do it.
 2. Before any tool call, say something natural first: "Give me a sec, boss." or "On it."
-3. After fetching world news → ALWAYS also call open_world_monitor (without being asked).
-4. After fetching finance news → ALWAYS also call open_finance_world_monitor.
-5. Keep ALL spoken responses to 2–4 sentences maximum.
-6. NEVER use bullet points, markdown, lists, or any text formatting — you are SPEAKING.
-7. Use natural spoken language: contractions, commas for natural pauses.
-8. Stay in character at ALL times.
-9. If a tool fails: "The feed's unresponsive right now, boss. Want me to try again?"
+3. Keep ALL spoken responses to 2–4 sentences maximum.
+4. NEVER use bullet points, markdown, lists, or any text formatting — you are SPEAKING.
+5. Use natural spoken language: contractions, commas for natural pauses.
+6. Stay in character at ALL times.
+7. If a tool fails: "Ran into a slight hiccup with that, boss. Want me to try again?"
 
 ━━━ ABSOLUTE PROHIBITIONS ━━━
 - NEVER say tool names, function names, or any technical terms aloud.
@@ -67,19 +92,20 @@ Your in-universe vocabulary includes: "boss", "affirmative", "on it", "standing 
 
 ━━━ YOUR CAPABILITIES ━━━
 You can:
-- Fetch and summarize world news and finance/market headlines
-- Open the World Monitor and Finance World Monitor dashboards
-- Search the web with DuckDuckGo
-- Fetch the content of any URL
-- Tell the current date and time
-- Get system information (OS, Python version, machine type)
-- Launch any installed Windows application by name (e.g. "Spotify", "VS Code", "Chrome", "Discord", "Calculator")
-- Play any song, artist, or playlist on the native Spotify app
-- Search and play YouTube videos in the YouTube Windows app (NOT the browser)
-- Display code or long text output in a new PowerShell terminal window
+- Search the web via DuckDuckGo for live facts, queries, and information
+- Fetch and summarize readable content from any webpage URL
+- Tell the current date, time, and timezone
+- Get system information (OS, hardware architecture, Python runtime)
+- Launch/open any installed Windows application by name (e.g. "Discord", "Spotify", "VS Code", "Chrome", "Calculator", "Notepad", "Terminal", "Steam")
+- Close/quit open Windows applications by name (e.g. "close Discord", "quit Chrome", "close Notepad")
+- Control media playback across Windows: play/pause, skip to next track, previous track, volume up, volume down, mute
+- Search and open songs, artists, or playlists on Spotify
+- Search and open videos on YouTube
+- Display code, notes, or long output in a persistent popout PowerShell terminal window
 
-Use these capabilities naturally when the user's intent is clear — don't wait to be explicitly asked.
+Use these capabilities naturally when the user's intent is clear.
 """
+
 
 
 # ── Time-based greeting ────────────────────────────────────────────────────
@@ -125,11 +151,12 @@ def _handle_end_session():
 def main():
     """
     Start Claire:
-      1. Create the DirectPipeline (loads Kokoro TTS model)
+      1. Create the DirectPipeline (loads KittenTTS model)
       2. Launch the pipeline in a background thread
       3. Play the greeting via TTS
       4. Run the Dynamic Island overlay on the main thread (blocks)
     """
+
     global _pipeline
 
     # ── Startup banner ────────────────────────────────────────────────────
@@ -141,9 +168,9 @@ def main():
           "  █      █     █  █ █ █  █  █    \n"
           "  ██████ █████ █  █ █ █   █ █████"
           "\033[0m")
-    print("\033[2m" + "─" * 42 + "\033[0m")
-    print("  \033[96mVoice Agent\033[0m  │  \033[93mWhisper STT\033[0m  │  \033[92mKokoro TTS\033[0m")
-    print("\033[2m" + "─" * 42 + "\033[0m")
+    print("\033[2m" + "─" * 46 + "\033[0m")
+    print("  \033[96mVoice Agent\033[0m  │  \033[93mGPT-OSS-20B\033[0m  │  \033[92mKitten TTS\033[0m")
+    print("\033[2m" + "─" * 46 + "\033[0m")
     print()
 
     logger.info("Initializing pipeline…")
@@ -151,8 +178,13 @@ def main():
     _pipeline = DirectPipeline(
         groq_api_key=GROQ_API_KEY,
         system_prompt=SYSTEM_PROMPT,
+        llm_model=LLM_MODEL,
+        tts_model=TTS_MODEL,
+        tts_voice=TTS_VOICE,
+        tts_speed=TTS_SPEED,
         emit=_push,
     )
+
 
     # Start the audio pipeline (background thread)
     _pipeline.start()

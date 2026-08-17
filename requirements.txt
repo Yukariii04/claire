@@ -1,0 +1,20 @@
+# ── Core Dependencies for Claire Voice Assistant ─────────────────────────────
+# Python Requirement: 3.11.x or 3.12.x (Recommended: 3.12)
+
+httpx>=0.27.0,<=0.28.1               # Fast async/sync HTTP client for Groq API
+sounddevice>=0.4.6,<=0.5.5           # Low-latency mic capture & speaker playback
+soundfile>=0.12.1,<=0.14.0           # Audio buffer and WAV handling
+numpy>=1.26.0,<=2.5.2                # Audio array DSP and RMS energy VAD
+duckduckgo_search>=6.0.0,<=8.1.1     # Free web search tool (no API key required)
+python-dotenv>=1.0.0,<=1.2.3         # .env configuration loader
+customtkinter>=5.2.0,<=6.0.0         # Dynamic Island floating overlay UI
+pillow>=10.0.0,<=12.3.0                # Custom avatar image processing
+
+
+# ── KittenTTS (Latest GitHub Release Wheel) ──────────────────────────────────
+https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl
+
+# ── Install package in editable mode and register 'claire' CLI command ──────
+-e .
+
+

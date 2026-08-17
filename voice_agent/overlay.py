@@ -20,13 +20,18 @@ import time
 import tkinter as tk
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Callable
 
 import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
+_ASSETS_DIR      = Path(__file__).parent / "assets"
+_AVATAR_PATH     = _ASSETS_DIR / "avatar.png"
 _TRANSPARENT_COLOR = "#000001"
+
 
 # Palette — deep dark with accent glow
 _BG_PILL         = "#0A0A0F"
@@ -54,12 +59,9 @@ _CORNER_RADIUS   = 28
 _ANIM_DURATION_MS = 420         # total expand/collapse time
 _ANIM_TICK_MS     = 10          # ~100 fps
 
-# Canvas orb
-_ORB_RADIUS       = 13
-_ORB_GLOW_RADIUS  = 20
-
 # Chevron canvas
 _CHEV_SIZE        = 34           # canvas dimension
+
 
 
 # ── Data Types ─────────────────────────────────────────────────────────────
@@ -130,8 +132,28 @@ class ClaireOverlay:
         self._chev_glow   = 0.0        # 0..1 glow intensity (animated)
         self._drag_data   = {"x": 0, "y": 0}
         self._border_glow_phase = 0.0  # animated border glow
+        self._pill_avatar_tk: ImageTk.PhotoImage | None = None
+        self._exp_avatar_tk: ImageTk.PhotoImage | None = None
 
     # ── Public ─────────────────────────────────────────────────────────
+
+    def _load_avatar(self, size: int) -> ImageTk.PhotoImage | None:
+        """Load and circular-crop the avatar image with anti-aliasing."""
+        try:
+            if _AVATAR_PATH.exists():
+                img = Image.open(_AVATAR_PATH).convert("RGBA")
+                mask_size = size * 3
+                mask = Image.new("L", (mask_size, mask_size), 0)
+                draw = ImageDraw.Draw(mask)
+                draw.ellipse((0, 0, mask_size - 1, mask_size - 1), fill=255)
+                
+                cropped = ImageOps.fit(img, (mask_size, mask_size), centering=(0.5, 0.5))
+                cropped.putalpha(mask)
+                resized = cropped.resize((size, size), Image.Resampling.LANCZOS)
+                return ImageTk.PhotoImage(resized)
+        except Exception:
+            pass
+        return None
 
     def run(self):
         """Start the overlay — blocks, must run on main thread."""
@@ -144,6 +166,10 @@ class ClaireOverlay:
         self._root.configure(fg_color=_TRANSPARENT_COLOR)
         self._root.attributes("-transparentcolor", _TRANSPARENT_COLOR)
 
+        # Pre-load custom circular avatar images
+        self._pill_avatar_tk = self._load_avatar(32)
+        self._exp_avatar_tk = self._load_avatar(36)
+
         # Centre-top of screen
         screen_w = self._root.winfo_screenwidth()
         x = (screen_w - _PILL_W) // 2
@@ -153,6 +179,7 @@ class ClaireOverlay:
         self._build_pill()
         self._build_expanded_panel()
         self._show_pill()
+
 
         # Start animation loops
         self._root.after(20, self._poll_events)
@@ -185,12 +212,12 @@ class ClaireOverlay:
         inner = ctk.CTkFrame(self._pill_frame, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=16, pady=6)
 
-        # ── Orb (left)
+        # ── Avatar (left)
         self._orb_canvas = tk.Canvas(
-            inner, width=36, height=36,
-            bg=_BG_PILL, highlightthickness=0, bd=0,
+            inner, width=38, height=38,
+            bg=_BG_PILL, highlightthickness=0, bd=0, cursor="hand2",
         )
-        self._orb_canvas.pack(side="left", padx=(0, 12))
+        self._orb_canvas.pack(side="left", padx=(0, 10))
 
         # ── Centre text
         center = ctk.CTkFrame(inner, fg_color="transparent")
@@ -221,13 +248,14 @@ class ClaireOverlay:
         self._pill_chev_canvas.bind("<Button-1>", lambda e: self._toggle_expand())
 
         # ── Make the whole pill clickable to expand (double-click)
-        for w in (self._pill_frame, inner, center, self._pill_title, self._pill_subtitle):
+        for w in (self._pill_frame, inner, center, self._pill_title, self._pill_subtitle, self._orb_canvas):
             w.bind("<Double-Button-1>", lambda e: self._toggle_expand())
 
         # ── Drag
-        for w in (self._pill_frame, inner, center, self._pill_title, self._pill_subtitle):
+        for w in (self._pill_frame, inner, center, self._pill_title, self._pill_subtitle, self._orb_canvas):
             w.bind("<Button-1>", self._start_drag)
             w.bind("<B1-Motion>", self._on_drag)
+
 
     # ══════════════════════════════════════════════════════════════════
     #  BUILD — Expanded Panel
@@ -250,11 +278,12 @@ class ClaireOverlay:
         header.pack(fill="x", padx=20, pady=(16, 4))
         header.pack_propagate(False)
 
+        # ── Avatar (left)
         self._exp_orb_canvas = tk.Canvas(
-            header, width=36, height=36,
-            bg=_BG_EXPANDED, highlightthickness=0, bd=0,
+            header, width=42, height=42,
+            bg=_BG_EXPANDED, highlightthickness=0, bd=0, cursor="hand2",
         )
-        self._exp_orb_canvas.pack(side="left", padx=(0, 12))
+        self._exp_orb_canvas.pack(side="left", padx=(0, 10))
 
         hdr_text = ctk.CTkFrame(header, fg_color="transparent")
         hdr_text.pack(side="left", fill="both", expand=True)
@@ -284,13 +313,14 @@ class ClaireOverlay:
         self._exp_chev_canvas.bind("<Button-1>", lambda e: self._toggle_expand())
 
         # Drag on header
-        for w in (header, hdr_text, self._exp_title):
+        for w in (header, hdr_text, self._exp_title, self._exp_orb_canvas):
             w.bind("<Button-1>", self._start_drag)
             w.bind("<B1-Motion>", self._on_drag)
 
         # ── Divider
         ctk.CTkFrame(self._exp_frame, fg_color=_BORDER_COLOR, height=1
                       ).pack(fill="x", padx=20, pady=(8, 8))
+
 
         # ── Transcript area ───────────────────────────────────────────
         transcript = ctk.CTkFrame(self._exp_frame, fg_color="transparent")
@@ -512,50 +542,53 @@ class ClaireOverlay:
         self._border_glow_phase += 0.04
 
         # Redraw canvases
-        self._draw_orb(self._orb_canvas, _BG_PILL)
-        self._draw_orb(self._exp_orb_canvas, _BG_EXPANDED)
+        self._draw_avatar(self._orb_canvas, _BG_PILL, is_expanded=False)
+        self._draw_avatar(self._exp_orb_canvas, _BG_EXPANDED, is_expanded=True)
         self._draw_chevron(self._pill_chev_canvas, _BG_PILL)
         self._draw_chevron(self._exp_chev_canvas, _BG_EXPANDED)
 
         self._root.after(25, self._tick_animations)
 
     # ══════════════════════════════════════════════════════════════════
-    #  DRAW — Animated Orb
+    #  DRAW — Custom Animated Avatar
     # ══════════════════════════════════════════════════════════════════
 
-    def _draw_orb(self, canvas: tk.Canvas, bg: str):
+    def _draw_avatar(self, canvas: tk.Canvas, bg: str, is_expanded: bool = False):
         canvas.delete("all")
-        cx, cy = 18, 18
+        cx = 19 if not is_expanded else 21
+        cy = 19 if not is_expanded else 21
+        avatar_img = self._exp_avatar_tk if is_expanded else self._pill_avatar_tk
+        avatar_r = 15 if not is_expanded else 17
         accent = self._accent_for_state()
         pulse = 0.5 + 0.5 * math.sin(self._orb_phase)
 
-        if self._state == AgentState.IDLE:
-            # Gentle breathing dot
-            breath = 0.55 + 0.1 * math.sin(self._orb_phase)
-            r = _ORB_RADIUS * breath
-            canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                               fill=_ACCENT_IDLE, outline="")
-            return
+        # ── State-reactive glowing aura
+        if self._state != AgentState.IDLE:
+            # Active glowing rings (Listening / Thinking / Speaking)
+            for i in range(3):
+                ri = avatar_r + 2.0 + pulse * 2.0 + i * 1.5
+                glow = self._blend_color(accent, bg, 0.40 + i * 0.20)
+                canvas.create_oval(cx - ri, cy - ri, cx + ri, cy + ri,
+                                   fill="", outline=glow, width=1.2)
+        else:
+            # Gentle ambient halo when idle
+            halo_glow = self._blend_color(_ACCENT_IDLE, bg, 0.70)
+            canvas.create_oval(cx - avatar_r - 2, cy - avatar_r - 2,
+                               cx + avatar_r + 2, cy + avatar_r + 2,
+                               fill="", outline=halo_glow, width=1.0)
 
-        # Outer glow rings (layered for soft bloom)
-        for i in range(5):
-            ri = _ORB_GLOW_RADIUS + pulse * 4 + i * 2.5
-            glow = self._blend_color(accent, bg, 0.45 + i * 0.12)
-            canvas.create_oval(cx - ri, cy - ri, cx + ri, cy + ri,
-                               fill="", outline=glow, width=1.2)
+        # ── Custom Anime Avatar Image
+        if avatar_img:
+            canvas.create_image(cx, cy, image=avatar_img)
+            # Glowing accent border ring around avatar
+            border_col = self._blend_color(accent, bg, 0.35)
+            canvas.create_oval(cx - avatar_r, cy - avatar_r, cx + avatar_r, cy + avatar_r,
+                               fill="", outline=border_col, width=1.4)
+        else:
+            # Fallback circle
+            canvas.create_oval(cx - avatar_r, cy - avatar_r, cx + avatar_r, cy + avatar_r,
+                               fill=accent, outline="")
 
-        # Core orb with size pulse
-        r = _ORB_RADIUS * (0.82 + 0.18 * pulse)
-        canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                           fill=accent, outline="")
-
-        # 3D highlight (specular dot, offset up-left)
-        hr = r * 0.32
-        ox, oy = -r * 0.22, -r * 0.28
-        highlight = self._blend_color(accent, "#FFFFFF", 0.55)
-        canvas.create_oval(cx + ox - hr, cy + oy - hr,
-                           cx + ox + hr, cy + oy + hr,
-                           fill=highlight, outline="")
 
     # ══════════════════════════════════════════════════════════════════
     #  DRAW — 3D Animated Chevron

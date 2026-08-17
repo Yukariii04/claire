@@ -1,13 +1,13 @@
 """
 Claire Voice Agent — Direct Local Pipeline  (no LiveKit)
-Pipeline: sounddevice mic → Groq Whisper STT → Groq LLM (with tools) → Kokoro TTS → sounddevice speaker
+Pipeline: sounddevice mic → Groq Whisper STT → Groq LLM (with tools) → KittenTTS → sounddevice speaker
 
 This replaces the entire LiveKit agent framework with a lightweight,
 direct audio pipeline.  Everything runs locally except the Groq LLM/STT calls.
 """
 
-from __future__ import annotations
-
+import ctypes
+import glob
 import io
 import json
 import logging
@@ -20,25 +20,31 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import warnings
 import wave
 import webbrowser
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+# Suppress NumPy, sounddevice, and package deprecation/runtime warnings
+warnings.filterwarnings("ignore")
+
+
 import httpx
 import numpy as np
 import sounddevice as sd
-from kokoro_onnx import Kokoro
+from kittentts import KittenTTS
 
 logger = logging.getLogger("claire.pipeline")
+
 
 # ── Audio Constants ────────────────────────────────────────────────────────
 SAMPLE_RATE     = 16000       # 16 kHz mono for Whisper
 CHANNELS        = 1
 BLOCK_SIZE      = 4000        # 250 ms chunks
-TTS_SAMPLE_RATE = 24000       # Kokoro outputs 24 kHz
+TTS_SAMPLE_RATE = 24000       # KittenTTS outputs 24 kHz
+
 
 # ── VAD Constants ──────────────────────────────────────────────────────────
 ENERGY_THRESHOLD   = 300      # RMS energy to consider "speech"
@@ -91,17 +97,8 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "get_world_news",
-            "description": "Fetch the latest world news headlines from BBC, CNBC, NYT, and Al Jazeera.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-
-    {
-        "type": "function",
-        "function": {
             "name": "search_web",
-            "description": "Search the web using DuckDuckGo and return the top 5 results.",
+            "description": "Search the web using DuckDuckGo and return the top search results.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Search query"}},
@@ -113,7 +110,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "fetch_url",
-            "description": "Fetch the raw text content of any URL (max 4000 chars).",
+            "description": "Fetch readable text content from any website or URL.",
             "parameters": {
                 "type": "object",
                 "properties": {"url": {"type": "string", "description": "URL to fetch"}},
@@ -125,7 +122,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_current_time",
-            "description": "Return the current date and time in ISO 8601 format (UTC).",
+            "description": "Return the current date and time (UTC and ISO 8601).",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -141,10 +138,10 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "launch_app",
-            "description": "Open any installed Windows application by name. Examples: 'Spotify', 'VS Code', 'Chrome', 'Calculator', 'Discord'.",
+            "description": "Open or launch any installed Windows application by name (e.g., 'Discord', 'Spotify', 'VS Code', 'Chrome', 'Calculator', 'Notepad', 'Terminal', 'Steam').",
             "parameters": {
                 "type": "object",
-                "properties": {"app_name": {"type": "string", "description": "Name of the application"}},
+                "properties": {"app_name": {"type": "string", "description": "Name of the application to open"}},
                 "required": ["app_name"],
             },
         },
@@ -152,8 +149,38 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "close_app",
+            "description": "Close or terminate an open Windows application by name (e.g., 'Discord', 'Spotify', 'Chrome', 'Notepad', 'Calculator', 'VS Code').",
+            "parameters": {
+                "type": "object",
+                "properties": {"app_name": {"type": "string", "description": "Name of the application to close"}},
+                "required": ["app_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "control_media",
+            "description": "Control Windows system and app media playback (Spotify, YouTube, video/music players). Actions: 'play_pause', 'next', 'previous', 'stop', 'volume_up', 'volume_down', 'mute'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action to perform: 'play_pause', 'next', 'previous', 'stop', 'volume_up', 'volume_down', 'mute'",
+                        "enum": ["play_pause", "next", "previous", "stop", "volume_up", "volume_down", "mute"],
+                    }
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "play_spotify",
-            "description": "Search for and play a song, artist, or playlist on the native Spotify app.",
+            "description": "Search for and open a song, artist, album, or playlist on Spotify.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Song, artist, or playlist name"}},
@@ -165,7 +192,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "play_youtube",
-            "description": "Search for and play a video on the YouTube Windows app.",
+            "description": "Search for and open a video on YouTube.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Video search query"}},
@@ -192,125 +219,327 @@ TOOL_SCHEMAS = [
 ]
 
 
-# ── Tool Implementations (inline — no MCP server needed) ──────────────────
+# ── Tool Implementations (Native Windows & Web) ───────────────────────────
 
-HEADERS = {"User-Agent": "Claire-AI/1.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Claire/1.0"}
 
-WORLD_NEWS_FEEDS = [
-    ("BBC",       "https://feeds.bbci.co.uk/news/world/rss.xml"),
-    ("CNBC",      "https://www.cnbc.com/id/100727362/device/rss/rss.html"),
-    ("NYT",       "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"),
-    ("AlJazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
-]
-
-FINANCE_NEWS_FEEDS = [
-    ("CNBC Finance", "https://www.cnbc.com/id/10000664/device/rss/rss.html"),
-    ("Bloomberg",    "https://feeds.bloomberg.com/markets/news.rss"),
-    ("Reuters",      "https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best"),
-    ("MarketWatch",  "https://feeds.marketwatch.com/marketwatch/topstories/"),
-    ("NYT Business", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"),
-]
-
-APP_MAP = {
-    "chrome": "chrome.exe", "google chrome": "chrome.exe",
-    "firefox": "firefox.exe", "edge": "msedge.exe", "microsoft edge": "msedge.exe",
-    "vs code": "code", "vscode": "code", "visual studio code": "code",
-    "notepad": "notepad.exe", "terminal": "wt.exe", "windows terminal": "wt.exe",
-    "powershell": "powershell.exe", "cmd": "cmd.exe",
-    "spotify": "spotify.exe", "discord": "discord.exe", "vlc": "vlc.exe",
-    "calculator": "calc.exe", "file explorer": "explorer.exe", "explorer": "explorer.exe",
-    "task manager": "taskmgr.exe", "settings": "ms-settings:",
-    "paint": "mspaint.exe", "word": "winword.exe", "excel": "excel.exe",
-}
+# Virtual key codes for Windows media control
+VK_VOLUME_MUTE      = 0xAD
+VK_VOLUME_DOWN      = 0xAE
+VK_VOLUME_UP        = 0xAF
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+VK_MEDIA_STOP       = 0xB2
+VK_MEDIA_PLAY_PAUSE = 0xB3
 
 
-def _strip_html(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text or "").strip()
-
-
-def _fetch_feed_sync(source: str, url: str) -> list[dict]:
-    """Fetch a single RSS feed synchronously. Returns up to 5 items."""
+def _send_virtual_key(vk_code: int):
+    """Simulate a native Windows virtual key press using hardware scan code."""
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP       = 0x0002
     try:
-        resp = httpx.get(url, timeout=5, headers=HEADERS, follow_redirects=True)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.text)
-        items = []
-        for item in root.iter("item"):
-            title = _strip_html(getattr(item.find("title"), "text", "") or "")
-            desc  = _strip_html(getattr(item.find("description"), "text", "") or "")
-            link  = (getattr(item.find("link"), "text", "") or "").strip()
-            if title:
-                items.append({"source": source, "title": title, "desc": desc[:200], "link": link})
-            if len(items) >= 5:
-                break
-        return items
-    except Exception:
-        return []
+        u32 = ctypes.windll.user32
+        scan = u32.MapVirtualKeyW(vk_code, 0)
+        u32.keybd_event(vk_code, scan, KEYEVENTF_EXTENDEDKEY, 0)
+        time.sleep(0.05)
+        u32.keybd_event(vk_code, scan, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+    except Exception as e:
+        logger.warning("Virtual key simulation failed: %s", e)
 
 
-def _fetch_news(feeds: list[tuple[str, str]], limit: int = 12) -> str:
-    """Fetch multiple RSS feeds using threads for parallelism."""
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=len(feeds)) as pool:
-        futures = [pool.submit(_fetch_feed_sync, src, url) for src, url in feeds]
-        all_items = []
-        for f in futures:
-            all_items.extend(f.result())
-    if not all_items:
-        return ""
-    lines = []
-    for it in all_items[:limit]:
-        lines.append(f"**[{it['source']}]** {it['title']}")
-        if it["desc"]:
-            lines.append(f"{it['desc']}...")
-        if it["link"]:
-            lines.append(f"Link: {it['link']}")
-        lines.append("")
-    return "\n".join(lines).strip()
+
+def _control_media(action: str) -> str:
+    """Control Windows media playback."""
+    act = action.lower().strip().replace("-", "_").replace(" ", "_")
+    if act in ("play", "pause", "play_pause", "toggle"):
+        _send_virtual_key(VK_MEDIA_PLAY_PAUSE)
+        return "Toggled media playback, boss."
+    elif act in ("next", "next_track", "skip"):
+        _send_virtual_key(VK_MEDIA_NEXT_TRACK)
+        return "Skipped to the next track, boss."
+    elif act in ("prev", "previous", "prev_track", "back"):
+        _send_virtual_key(VK_MEDIA_PREV_TRACK)
+        return "Went back to the previous track, boss."
+    elif act in ("stop",):
+        _send_virtual_key(VK_MEDIA_STOP)
+        return "Stopped media playback, boss."
+    elif act in ("volume_up", "vol_up", "louder"):
+        for _ in range(3):
+            _send_virtual_key(VK_VOLUME_UP)
+        return "Turned the volume up, boss."
+    elif act in ("volume_down", "vol_down", "quieter"):
+        for _ in range(3):
+            _send_virtual_key(VK_VOLUME_DOWN)
+        return "Turned the volume down, boss."
+    elif act in ("mute", "unmute", "toggle_mute"):
+        _send_virtual_key(VK_VOLUME_MUTE)
+        return "Toggled volume mute, boss."
+    else:
+        return f"Unknown media action: {action}"
 
 
 def _run_uri(uri: str) -> None:
-    subprocess.Popen(["cmd", "/c", "start", "", uri], shell=False)
+    """Open a URI or URL via Windows shell."""
+    try:
+        subprocess.Popen(["cmd", "/c", "start", "", uri], shell=False)
+    except Exception:
+        webbrowser.open(uri)
+
+
+def _launch_windows_app(app_name: str) -> str:
+    """Robust application launcher for Windows."""
+    raw = app_name.strip()
+    key = raw.lower()
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    appdata = os.environ.get("APPDATA", "")
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+
+    known_targets: dict[str, list[str]] = {
+        "discord": [
+            os.path.join(local_appdata, "Discord", "Update.exe --processStart Discord.exe"),
+            "discord:",
+        ],
+        "spotify": [
+            "spotify:",
+            os.path.join(appdata, "Spotify", "Spotify.exe"),
+        ],
+        "chrome": [
+            os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe"),
+            "chrome.exe",
+        ],
+        "google chrome": [
+            os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe"),
+            "chrome.exe",
+        ],
+        "firefox": [
+            os.path.join(program_files, "Mozilla Firefox", "firefox.exe"),
+            "firefox.exe",
+        ],
+        "edge": ["msedge.exe"],
+        "microsoft edge": ["msedge.exe"],
+        "vs code": [
+            os.path.join(local_appdata, "Programs", "Microsoft VS Code", "Code.exe"),
+            "code.cmd",
+            "code",
+        ],
+        "vscode": [
+            os.path.join(local_appdata, "Programs", "Microsoft VS Code", "Code.exe"),
+            "code.cmd",
+            "code",
+        ],
+        "code": [
+            os.path.join(local_appdata, "Programs", "Microsoft VS Code", "Code.exe"),
+            "code.cmd",
+            "code",
+        ],
+        "notepad": ["notepad.exe"],
+        "calculator": ["calc.exe"],
+        "calc": ["calc.exe"],
+        "terminal": ["wt.exe", "powershell.exe"],
+        "windows terminal": ["wt.exe"],
+        "powershell": ["powershell.exe"],
+        "cmd": ["cmd.exe"],
+        "task manager": ["taskmgr.exe"],
+        "settings": ["ms-settings:"],
+        "steam": [
+            "steam:",
+            os.path.join(program_files_x86, "Steam", "steam.exe"),
+        ],
+        "obsidian": [
+            os.path.join(local_appdata, "Obsidian", "Obsidian.exe"),
+        ],
+        "telegram": [
+            "tg:",
+            os.path.join(appdata, "Telegram Desktop", "Telegram.exe"),
+        ],
+        "vlc": [
+            os.path.join(program_files, "VideoLAN", "VLC", "vlc.exe"),
+            "vlc.exe",
+        ],
+        "explorer": ["explorer.exe"],
+        "file explorer": ["explorer.exe"],
+        "paint": ["mspaint.exe"],
+        "word": ["winword.exe"],
+        "excel": ["excel.exe"],
+    }
+
+    # 1. Check known candidates
+    if key in known_targets:
+        for target in known_targets[key]:
+            if target.endswith(":") or target.startswith(("http:", "https:", "discord:", "spotify:", "tg:", "steam:", "ms-settings:")):
+                _run_uri(target)
+                return f"Opening {raw} for you, boss."
+            
+            # Executable with arguments (e.g. Update.exe --processStart Discord.exe)
+            if " --" in target:
+                exe_part = target.split(" --")[0]
+                if os.path.exists(exe_part):
+                    subprocess.Popen(target, shell=True)
+                    return f"Opening {raw} for you, boss."
+            elif os.path.exists(target):
+                subprocess.Popen(f'"{target}"', shell=True)
+                return f"Opening {raw} for you, boss."
+
+    # 2. Check Discord app-* directory wildcard if Discord was requested
+    if "discord" in key:
+        discord_apps = glob.glob(os.path.join(local_appdata, "Discord", "app-*", "Discord.exe"))
+        if discord_apps:
+            subprocess.Popen(f'"{discord_apps[-1]}"', shell=True)
+            return f"Opening Discord for you, boss."
+
+    # 3. Search Start Menu shortcuts
+    start_menu_dirs = [
+        os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs"),
+        os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), r"Microsoft\Windows\Start Menu\Programs"),
+    ]
+    for sm_dir in start_menu_dirs:
+        if os.path.exists(sm_dir):
+            for lnk in glob.glob(os.path.join(sm_dir, "**", "*.lnk"), recursive=True):
+                lnk_name = os.path.basename(lnk).lower().replace(".lnk", "")
+                if key in lnk_name or lnk_name in key:
+                    try:
+                        os.startfile(lnk)
+                        return f"Opening {raw} for you, boss."
+                    except Exception:
+                        pass
+
+    # 4. Fallback: try direct startfile or shell command
+    try:
+        os.startfile(raw)
+        return f"Opening {raw} for you, boss."
+    except Exception:
+        pass
+
+    try:
+        subprocess.Popen(raw, shell=True)
+        return f"Opening {raw} for you, boss."
+    except Exception as e:
+        return f"Could not launch '{raw}': {e}"
+
+
+def _close_windows_app(app_name: str) -> str:
+    """Close/terminate an application by name on Windows."""
+    raw = app_name.strip()
+    key = raw.lower()
+
+    if not key or len(key) < 2:
+        return "Which application would you like me to close, boss?"
+
+    proc_map: dict[str, list[str]] = {
+        "discord": ["Discord.exe"],
+        "spotify": ["Spotify.exe"],
+        "chrome": ["chrome.exe"],
+        "google chrome": ["chrome.exe"],
+        "firefox": ["firefox.exe"],
+        "edge": ["msedge.exe"],
+        "microsoft edge": ["msedge.exe"],
+        "vs code": ["Code.exe"],
+        "vscode": ["Code.exe"],
+        "code": ["Code.exe"],
+        "visual studio code": ["Code.exe"],
+        "notepad": ["notepad.exe", "Notepad.exe"],
+        "calculator": ["CalculatorApp.exe", "calc.exe"],
+        "calc": ["CalculatorApp.exe", "calc.exe"],
+        "terminal": ["WindowsTerminal.exe", "wt.exe"],
+        "windows terminal": ["WindowsTerminal.exe"],
+        "powershell": ["powershell.exe"],
+        "cmd": ["cmd.exe"],
+        "task manager": ["Taskmgr.exe", "taskmgr.exe"],
+        "vlc": ["vlc.exe"],
+        "steam": ["steam.exe", "Steam.exe"],
+        "obsidian": ["Obsidian.exe"],
+        "telegram": ["Telegram.exe"],
+    }
+
+    try:
+        tasklist_out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, check=False).stdout.lower()
+    except Exception:
+        tasklist_out = ""
+
+    targets = proc_map.get(key, [f"{key}.exe", key])
+    killed = False
+    for target in targets:
+        target_clean = target if target.endswith(".exe") else f"{target}.exe"
+        if target_clean.lower() in tasklist_out or not tasklist_out:
+            res = subprocess.run(
+                ["taskkill", "/F", "/IM", target_clean],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if res.returncode == 0:
+                killed = True
+
+    if killed:
+        return f"Closed {raw} for you, boss."
+
+    # Search running processes in tasklist matching key
+    if tasklist_out:
+        matched = []
+        for line in tasklist_out.splitlines():
+            parts = line.split(",")
+            if parts:
+                pname = parts[0].strip('"').lower()
+                if key in pname:
+                    matched.append(pname)
+        if matched:
+            for m in set(matched):
+                subprocess.run(["taskkill", "/F", "/IM", m], capture_output=True, text=True, check=False)
+            return f"Closed {raw} for you, boss."
+
+    return f"I couldn't find '{raw}' running on your system, boss."
+
+
+
+def _fetch_url(url: str) -> str:
+    """Fetch clean, readable text from a URL."""
+    try:
+        u = url.strip()
+        if not u.startswith(("http://", "https://")):
+            u = "https://" + u
+        resp = httpx.get(u, timeout=8, headers=HEADERS, follow_redirects=True)
+        if resp.status_code >= 400:
+            return f"Could not access page (HTTP {resp.status_code}), boss."
+        text = re.sub(r"<script.*?</script>", "", resp.text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = " ".join(text.split())
+        return text[:3000] if text else "The webpage appears to have no readable text, boss."
+    except Exception as e:
+        return f"Could not fetch that website: {e}"
+
+
+def _search_web(query: str) -> str:
+    """Search DuckDuckGo safely without throwing errors."""
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query.strip(), max_results=5))
+        if not results:
+            return f"No search results found for '{query}', boss."
+        lines = []
+        for r in results:
+            title = r.get("title", "No title")
+            body = r.get("body", "")
+            href = r.get("href", "")
+            lines.append(f"**{title}**\n{body}\nLink: {href}\n")
+        return "\n".join(lines).strip()
+    except Exception as e:
+        return f"Search is temporarily unavailable: {e}"
 
 
 def _execute_tool(name: str, args: dict) -> str:
     """Execute a tool by name with given arguments. Returns result string."""
     try:
-        if name == "get_world_news":
-            result = _fetch_news(WORLD_NEWS_FEEDS)
-            return result or "The global news grid is unresponsive, sir."
-
-        elif name == "get_world_finance_news":
-            result = _fetch_news(FINANCE_NEWS_FEEDS)
-            return result or "The financial feeds are unresponsive right now, sir."
-
-        elif name == "open_world_monitor":
-            webbrowser.open("https://worldmonitor.app/")
-            return "Displaying the World Monitor on your primary screen now, sir."
-
-        elif name == "open_finance_world_monitor":
-            webbrowser.open("https://finance.worldmonitor.app/")
-            return "Displaying the Finance World Monitor on your primary screen now, sir."
-
-        elif name == "search_web":
-            from duckduckgo_search import DDGS
-            with DDGS() as ddgs:
-                results = list(ddgs.text(args.get("query", ""), max_results=5))
-            if not results:
-                return "Search is offline right now, boss."
-            lines = []
-            for r in results:
-                lines.append(f"**{r.get('title', 'No title')}**")
-                lines.append(r.get("body", ""))
-                lines.append(f"Link: {r.get('href', '')}")
-                lines.append("")
-            return "\n".join(lines).strip()
+        if name == "search_web":
+            return _search_web(args.get("query", ""))
 
         elif name == "fetch_url":
-            resp = httpx.get(args.get("url", ""), timeout=10, headers=HEADERS, follow_redirects=True)
-            resp.raise_for_status()
-            text = re.sub(r"<[^>]+>", "", resp.text)
-            return text[:4000]
+            return _fetch_url(args.get("url", ""))
 
         elif name == "get_current_time":
             return datetime.now(timezone.utc).isoformat()
@@ -324,28 +553,30 @@ def _execute_tool(name: str, args: dict) -> str:
             })
 
         elif name == "launch_app":
-            app_name = args.get("app_name", "")
-            key = app_name.lower().strip()
-            exe = APP_MAP.get(key)
-            if exe:
-                if exe.endswith(":"):
-                    _run_uri(exe)
-                else:
-                    subprocess.Popen(exe, shell=True)
-            else:
-                os.startfile(app_name)
-            return f"Opening {app_name} for you, boss."
+            return _launch_windows_app(args.get("app_name", ""))
+
+        elif name == "close_app":
+            return _close_windows_app(args.get("app_name", ""))
+
+        elif name == "control_media":
+            return _control_media(args.get("action", "play_pause"))
 
         elif name == "play_spotify":
-            query = args.get("query", "")
+            query = args.get("query", "").strip()
+            if not query or query.lower() in ("play", "resume", "music", "unpause"):
+                _send_virtual_key(VK_MEDIA_PLAY_PAUSE)
+                return "Toggled playback, boss."
             _run_uri(f"spotify:search:{urllib.parse.quote(query)}")
-            return f"Queuing up {query} on Spotify, boss."
+            time.sleep(0.5)
+            _send_virtual_key(VK_MEDIA_PLAY_PAUSE)
+            return f"Playing '{query}' on Spotify, boss."
+
 
         elif name == "play_youtube":
-            query = args.get("query", "")
+            query = args.get("query", "").strip()
             encoded = urllib.parse.quote(query)
-            _run_uri(f"youtube://www.youtube.com/results?search_query={encoded}")
-            return f"Pulling up {query} on YouTube for you, boss."
+            webbrowser.open(f"https://www.youtube.com/results?search_query={encoded}")
+            return f"Pulling up '{query}' on YouTube for you, boss."
 
         elif name == "show_code_in_terminal":
             code = args.get("code", "")
@@ -373,6 +604,7 @@ def _execute_tool(name: str, args: dict) -> str:
 
     except Exception as e:
         return f"Tool '{name}' failed: {e}"
+
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────
@@ -410,7 +642,7 @@ def _extract_inline_tool_calls(text: str) -> list[tuple[str, dict]]:
 class DirectPipeline:
     """
     Direct local voice pipeline:
-      Mic → energy VAD → Groq Whisper STT → Groq LLM (+ tool calling) → Kokoro TTS → Speaker
+      Mic → energy VAD → Groq Whisper STT → Groq LLM (+ tool calling) → KittenTTS → Speaker
 
     No LiveKit, no WebRTC, no browser.  Just your mic and speaker.
     """
@@ -420,13 +652,13 @@ class DirectPipeline:
         *,
         groq_api_key: str,
         system_prompt: str,
-        kokoro_model: str = "kokoro-v1_0.onnx",
-        voices_model: str = "voices-v1_0.bin",
-        tts_voice: str = "af_heart",
-        tts_speed: float = 1.15,
-        llm_model: str = "llama-3.1-8b-instant",
+        tts_model: str = "KittenML/kitten-tts-mini-0.8",
+        tts_voice: str = "Luna",
+        tts_speed: float = 1.20,
+        llm_model: str = "openai/gpt-oss-20b",
         emit: Callable[[str, str | None], None] | None = None,
     ):
+
         self._groq_key = groq_api_key
         self._system_prompt = system_prompt
         self._llm_model = llm_model
@@ -434,10 +666,15 @@ class DirectPipeline:
         self._tts_speed = tts_speed
         self._emit = emit or (lambda k, v: None)
 
-        # No Vosk model needed — we use Groq Whisper for STT
-        logger.info("Loading Kokoro TTS model…")
-        self._kokoro = Kokoro(kokoro_model, voices_model)
-        logger.info("Kokoro model loaded.")
+
+        # Initialize KittenTTS
+        logger.info("Loading KittenTTS model (%s)…", tts_model)
+        import contextlib
+        f_init = io.StringIO()
+        with contextlib.redirect_stdout(f_init), contextlib.redirect_stderr(f_init):
+            self._tts = KittenTTS(tts_model)
+        logger.info("KittenTTS model loaded. Voice: %s", self._tts_voice)
+
 
         # State
         self._running = False
@@ -449,6 +686,7 @@ class DirectPipeline:
         self._processing_lock = threading.Lock()
         self._last_interrupt = 0.0     # time of last interruption (seconds)
         self._last_tts_end = 0.0
+
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -586,12 +824,15 @@ class DirectPipeline:
             )
             resp.raise_for_status()
             text = resp.json().get("text", "").strip()
+            if not text or text.lower().strip() in _WHISPER_HALLUCINATIONS:
+                return ""
             _print_terminal("whisper", text)
             return text
         except Exception as e:
             logger.exception("Whisper STT error: %s", e)
             _print_terminal("error", f"STT failed: {e}")
             return ""
+
 
     # ── Process Utterance ──────────────────────────────────────────────
 
@@ -756,19 +997,27 @@ class DirectPipeline:
         The guard prevents the mic loop from processing audio while the TTS
         output is active, eliminating self-listening.
         """
+        if not text or not text.strip():
+            return
+
         # Mark playback start
         self._tts_event.set()
         self._speaking = True
         try:
-            samples, sr = self._kokoro.create(
-                text,
-                voice=self._tts_voice,
-                speed=self._tts_speed,
-                lang="en-us",
-            )
+            import contextlib
+            f_out = io.StringIO()
+            with contextlib.redirect_stdout(f_out), contextlib.redirect_stderr(f_out):
+                samples = self._tts.generate(
+                    text,
+                    voice=self._tts_voice,
+                    speed=self._tts_speed,
+                )
 
-            if self._interrupt_event.is_set():
+            if self._interrupt_event.is_set() or samples is None or len(samples) == 0:
                 return
+
+            samples = np.ascontiguousarray(samples, dtype=np.float32)
+            sr = TTS_SAMPLE_RATE
 
             sd.play(samples, sr)
 
@@ -777,7 +1026,7 @@ class DirectPipeline:
                 if self._interrupt_event.is_set():
                     sd.stop()
                     break
-                time.sleep(0.05)
+                time.sleep(0.04)
 
         except Exception as e:
             logger.exception("TTS playback error: %s", e)
@@ -785,3 +1034,5 @@ class DirectPipeline:
             self._speaking = False
             self._tts_event.clear()
             self._last_tts_end = time.time()
+
+

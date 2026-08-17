@@ -6,19 +6,30 @@ build-backend = "hatchling.build"
 name = "claire"
 version = "1.0.0"
 description = "Real-time AI voice assistant — local, free, and fully capable."
-requires-python = ">=3.11"
+requires-python = ">=3.11, <3.14"
 dependencies = [
-    "httpx",                                       # HTTP client for Groq API + RSS feeds
-    "kokoro-onnx",                                 # Local TTS engine (Kokoro-82M)
-    "sounddevice",                                 # Direct mic capture + speaker playback
-    "numpy",                                       # Array ops for audio processing
-    "duckduckgo_search",                           # Free web search — no API key needed
-    "python-dotenv",                               # .env file loading
-    "customtkinter",                               # Dynamic Island overlay UI
+    "httpx>=0.27.0,<=0.28.1",                     # HTTP client for Groq API + RSS feeds
+    "sounddevice>=0.4.6,<=0.5.5",                 # Direct mic capture + speaker playback
+    "soundfile>=0.12.1,<=0.14.0",                 # Audio I/O
+    "numpy>=1.26.0,<=2.5.2",                      # Array ops for audio processing
+    "duckduckgo_search>=6.0.0,<=8.1.1",           # Free web search — no API key needed
+    "python-dotenv>=1.0.0,<=1.2.3",               # .env file loading
+    "customtkinter>=5.2.0,<=6.0.0",               # Dynamic Island overlay UI
+    "pillow>=10.0.0,<=12.3.0",                    # Avatar and image processing
+    "kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl",
 ]
 
+
+
 [project.scripts]
-claire_voice = "voice_agent.agent_claire:dev"
+claire = "voice_agent.agent_claire:main"
+claire_voice = "voice_agent.agent_claire:main"
+
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["voice_agent"]
+
+
